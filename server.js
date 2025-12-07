@@ -16,6 +16,7 @@ const WebSocket = require('ws');
 const { createClient } = require('@deepgram/sdk');
 const OpenAI = require('openai');
 const axios = require('axios');
+const costTracker = require('./costTracker.js');
 
 // ===== Configuração =====
 const PORT = process.env.PORT || 3000;
@@ -44,6 +45,11 @@ wss.on('connection', (ws) => {
   let lastFinalTranscript = ''; // Guardar última transcrição final
   let processingTimeout = null; // Timeout para processar após silêncio
   let currentTTSAbortController = null; // FIX #12: Para cancelar TTS em andamento
+
+  // Cost tracking variables
+  let userId = null;
+  let simulationId = null;
+  let sessionStartTime = null; // Para calcular duração do áudio Deepgram
 
   // API Keys serão fornecidas pelo cliente
   let apiKeys = {
@@ -95,6 +101,16 @@ wss.on('connection', (ws) => {
           apiKeys.openai = (data.keys.openai || '').trim();
           apiKeys.elevenlabs = (data.keys.elevenlabs || '').trim();
 
+          // Capturar userId e simulationId para cost tracking
+          if (data.userId) {
+            userId = data.userId;
+            console.log('→ User ID recebido:', userId);
+          }
+          if (data.simulationId) {
+            simulationId = data.simulationId;
+            console.log('→ Simulation ID recebido:', simulationId);
+          }
+
           // Capturar system prompt customizado
           if (data.systemPrompt) {
             customSystemPrompt = data.systemPrompt;
@@ -145,6 +161,14 @@ wss.on('connection', (ws) => {
               message: 'Configure as API keys primeiro!'
             }));
             return;
+          }
+
+          // Iniciar cost tracking session
+          if (userId) {
+            costTracker.startSession(userId, simulationId);
+            sessionStartTime = Date.now(); // Marcar início para calcular duração do áudio
+          } else {
+            console.warn('⚠️  Cost tracking não iniciado: userId não fornecido');
           }
 
           // Verificar se a key do Deepgram está válida
@@ -214,6 +238,12 @@ wss.on('connection', (ws) => {
               }));
 
               console.log(`${isFinal ? '✓' : '...'} Transcrição: ${transcript}`);
+
+              // Track Deepgram usage quando temos transcrição final
+              if (isFinal && data.duration && userId) {
+                const durationSeconds = data.duration;
+                costTracker.trackDeepgram(durationSeconds);
+              }
 
               // Se é final, guardar e agendar processamento
               if (isFinal) {
@@ -360,6 +390,11 @@ wss.on('connection', (ws) => {
           conversationHistory = [];
           lastFinalTranscript = '';
           isProcessing = false;
+
+          // End cost tracking session
+          if (userId) {
+            await costTracker.endSession();
+          }
         }
       }
     } catch (error) {
@@ -369,10 +404,15 @@ wss.on('connection', (ws) => {
   });
 
   // Cliente desconectou
-  ws.on('close', () => {
+  ws.on('close', async () => {
     console.log('✗ Cliente desconectado');
     if (deepgramLive) {
       deepgramLive.finish();
+    }
+
+    // End cost tracking session on disconnect
+    if (userId) {
+      await costTracker.endSession();
     }
   });
 
@@ -512,6 +552,11 @@ wss.on('connection', (ws) => {
           }
         }));
         console.log(`📊 Tokens: ${tokenUsage.prompt_tokens} input + ${tokenUsage.completion_tokens} output = ${tokenUsage.total_tokens} total`);
+
+        // Track OpenAI usage
+        if (userId) {
+          costTracker.trackOpenAI(tokenUsage.prompt_tokens, tokenUsage.completion_tokens);
+        }
       }
 
       const totalTime = Date.now() - startTime;
@@ -532,6 +577,11 @@ wss.on('connection', (ws) => {
 
     try {
       console.log(`→ Gerando áudio com ElevenLabs (${text.length} chars)...`);
+
+      // Track ElevenLabs usage
+      if (userId) {
+        costTracker.trackElevenLabs(text.length);
+      }
 
       // Usar voice ID customizado do frontend, ou fallback para env var ou padrão
       const voiceId = customVoiceId || process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
