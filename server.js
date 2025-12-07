@@ -59,6 +59,9 @@ wss.on('connection', (ws) => {
   // System prompt customizado (vem do frontend)
   let customSystemPrompt = null;
 
+  // Voice ID customizado para ElevenLabs (vem do frontend)
+  let customVoiceId = null;
+
   ws.on('message', async (message) => {
     try {
       // Converter Buffer para string se necessário
@@ -96,6 +99,12 @@ wss.on('connection', (ws) => {
           if (data.systemPrompt) {
             customSystemPrompt = data.systemPrompt;
             console.log('→ System prompt customizado recebido:', customSystemPrompt.substring(0, 100) + '...');
+          }
+
+          // Capturar voice ID customizado para ElevenLabs
+          if (data.voiceId) {
+            customVoiceId = data.voiceId;
+            console.log('→ Voice ID ElevenLabs recebido:', customVoiceId);
           }
 
           console.log('→ Deepgram key:', apiKeys.deepgram.substring(0, 8) + '...' + apiKeys.deepgram.substring(apiKeys.deepgram.length - 4));
@@ -524,7 +533,9 @@ wss.on('connection', (ws) => {
     try {
       console.log(`→ Gerando áudio com ElevenLabs (${text.length} chars)...`);
 
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+      // Usar voice ID customizado do frontend, ou fallback para env var ou padrão
+      const voiceId = customVoiceId || process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+      console.log(`→ Usando Voice ID: ${voiceId}`);
       const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
 
       // FIX #12: AbortController para cancelar TTS se usuário interromper
