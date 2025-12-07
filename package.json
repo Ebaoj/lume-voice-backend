@@ -13,6 +13,7 @@
   "dependencies": {
     "openai": "^4.73.1",
     "@deepgram/sdk": "^3.8.0",
+    "@supabase/supabase-js": "^2.39.3",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "ws": "^8.18.0",
