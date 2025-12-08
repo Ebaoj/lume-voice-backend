@@ -16,7 +16,10 @@ const PRICING = {
     per_second: 0.0043 / 60,       // $0.0043 per minute
   },
   elevenlabs: {
-    per_character: 0.30 / 1_000_000, // $0.30 per 1M characters
+    per_character: 0.165 / 1_000,  // $0.165 per 1k characters (FIXED)
+  },
+  fishaudio: {
+    per_character: 0.015 / 1_000,  // $0.015 per 1k characters (91% cheaper than ElevenLabs)
   }
 }
 
@@ -36,11 +39,14 @@ class CostTracker {
       openai_cost: 0,
       deepgram_cost: 0,
       elevenlabs_cost: 0,
+      fishaudio_cost: 0,
       total_cost: 0,
       openai_input_tokens: 0,
       openai_output_tokens: 0,
       deepgram_seconds: 0,
-      elevenlabs_characters: 0
+      elevenlabs_characters: 0,
+      fishaudio_characters: 0,
+      tts_provider: null  // Track which TTS provider was used
     }
 
     console.log('🎯 Cost tracking session started:', {
@@ -116,10 +122,36 @@ class CostTracker {
     this.currentSession.elevenlabs_cost += cost
     this.currentSession.elevenlabs_characters += characters
     this.currentSession.total_cost += cost
+    this.currentSession.tts_provider = 'elevenlabs'
 
     console.log('💰 ElevenLabs TTS:', {
       characters,
       cost: `$${cost.toFixed(6)}`
+    })
+
+    return cost
+  }
+
+  /**
+   * Track Fish Audio TTS usage
+   */
+  trackFishAudio(characters) {
+    if (!this.currentSession) {
+      console.warn('⚠️  No active session. Call startSession() first.')
+      return 0
+    }
+
+    const cost = characters * PRICING.fishaudio.per_character
+
+    this.currentSession.fishaudio_cost += cost
+    this.currentSession.fishaudio_characters += characters
+    this.currentSession.total_cost += cost
+    this.currentSession.tts_provider = 'fishaudio'
+
+    console.log('💰 Fish Audio TTS:', {
+      characters,
+      cost: `$${cost.toFixed(6)}`,
+      savings: `${((1 - (PRICING.fishaudio.per_character / PRICING.elevenlabs.per_character)) * 100).toFixed(1)}% vs ElevenLabs`
     })
 
     return cost
@@ -144,6 +176,8 @@ class CostTracker {
       openai: `$${this.currentSession.openai_cost.toFixed(4)}`,
       deepgram: `$${this.currentSession.deepgram_cost.toFixed(4)}`,
       elevenlabs: `$${this.currentSession.elevenlabs_cost.toFixed(4)}`,
+      fishaudio: `$${this.currentSession.fishaudio_cost.toFixed(4)}`,
+      tts_provider: this.currentSession.tts_provider,
       total: `$${this.currentSession.total_cost.toFixed(4)}`
     })
 
@@ -159,11 +193,14 @@ class CostTracker {
           openai_cost: this.currentSession.openai_cost,
           deepgram_cost: this.currentSession.deepgram_cost,
           elevenlabs_cost: this.currentSession.elevenlabs_cost,
+          fishaudio_cost: this.currentSession.fishaudio_cost,
           total_cost: this.currentSession.total_cost,
           openai_input_tokens: this.currentSession.openai_input_tokens,
           openai_output_tokens: this.currentSession.openai_output_tokens,
           deepgram_seconds: this.currentSession.deepgram_seconds,
-          elevenlabs_characters: this.currentSession.elevenlabs_characters
+          elevenlabs_characters: this.currentSession.elevenlabs_characters,
+          fishaudio_characters: this.currentSession.fishaudio_characters,
+          tts_provider: this.currentSession.tts_provider
         })
         .select()
         .single()
