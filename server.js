@@ -18,6 +18,7 @@ const OpenAI = require('openai');
 const axios = require('axios');
 const costTracker = require('./costTracker.js');
 const AssistantManager = require('./assistantManager.js');
+const FishAudioService = require('./fishAudioService.js');
 
 // ===== Configuração =====
 const PORT = process.env.PORT || 3000;
@@ -56,19 +57,24 @@ wss.on('connection', (ws) => {
   let apiKeys = {
     deepgram: null,
     openai: null,
-    elevenlabs: null
+    elevenlabs: null,
+    fishaudio: null
   };
 
   // Clientes dos SDKs (criados após receber as keys)
   let deepgramClient = null;
   let openaiClient = null;
   let assistantManager = null; // Gerenciador de Assistants API (stateful)
+  let fishAudioService = null; // Serviço Fish Audio TTS
 
   // System prompt customizado (vem do frontend)
   let customSystemPrompt = null;
 
   // Voice ID customizado para ElevenLabs (vem do frontend)
   let customVoiceId = null;
+
+  // TTS Provider selecionado ('elevenlabs' ou 'fishaudio')
+  let ttsProvider = 'elevenlabs'; // Default ElevenLabs
 
   ws.on('message', async (message) => {
     try {
@@ -102,6 +108,13 @@ wss.on('connection', (ws) => {
           apiKeys.deepgram = (data.keys.deepgram || '').trim();
           apiKeys.openai = (data.keys.openai || '').trim();
           apiKeys.elevenlabs = (data.keys.elevenlabs || '').trim();
+          apiKeys.fishaudio = (data.keys.fishaudio || '').trim();
+
+          // Capturar TTS provider (elevenlabs ou fishaudio)
+          if (data.ttsProvider) {
+            ttsProvider = data.ttsProvider;
+            console.log('→ TTS Provider selecionado:', ttsProvider);
+          }
 
           // Capturar userId e simulationId para cost tracking
           if (data.userId) {
@@ -140,6 +153,12 @@ wss.on('connection', (ws) => {
             // Inicializar AssistantManager para conversas stateful
             assistantManager = new AssistantManager(openaiClient);
             console.log('✓ AssistantManager inicializado');
+
+            // Inicializar Fish Audio se key fornecida
+            if (apiKeys.fishaudio && apiKeys.fishaudio.length > 0) {
+              fishAudioService = new FishAudioService(apiKeys.fishaudio);
+              console.log('✓ FishAudioService inicializado');
+            }
 
             ws.send(JSON.stringify({
               type: 'configured',
@@ -526,90 +545,153 @@ wss.on('connection', (ws) => {
     }
   }
 
-  // ===== Função: Gerar TTS com ElevenLabs (Streaming) =====
+  // ===== Função: Gerar TTS (Fish Audio ou ElevenLabs) =====
   async function generateTTS(text, ws) {
     const ttsStart = Date.now();
 
     try {
-      console.log(`→ Gerando áudio com ElevenLabs (${text.length} chars)...`);
+      // Roteamento baseado no TTS provider selecionado
+      if (ttsProvider === 'fishaudio') {
+        console.log(`→ Gerando áudio com Fish Audio (${text.length} chars)...`);
 
-      // Track ElevenLabs usage
-      if (userId) {
-        costTracker.trackElevenLabs(text.length);
+        // Track Fish Audio usage
+        if (userId) {
+          costTracker.trackFishAudio(text.length);
+        }
+
+        // FIX #12: AbortController para cancelar TTS se usuário interromper
+        currentTTSAbortController = new AbortController();
+
+        // Chamar Fish Audio TTS com streaming
+        const response = await fishAudioService.textToSpeech(text, null, {});
+
+        const ttsTime = Date.now() - ttsStart;
+        console.log(`✓ Fish Audio stream iniciado (${ttsTime}ms)`);
+
+        // Enviar sinal de início
+        ws.send(JSON.stringify({ type: 'audio_start' }));
+
+        // Stream de áudio
+        let firstChunk = true;
+        response.data.on('data', (chunk) => {
+          if (firstChunk) {
+            const firstChunkTime = Date.now() - ttsStart;
+            console.log(`🎵 Primeiro chunk de áudio (${firstChunkTime}ms)`);
+            firstChunk = false;
+          }
+
+          // Verificar backpressure (buffer do WebSocket)
+          if (ws.bufferedAmount > 1024 * 1024) { // 1MB
+            console.warn('⚠️  Backpressure detectada, pausando stream');
+            response.data.pause();
+
+            // Retomar quando buffer diminuir
+            const checkBuffer = setInterval(() => {
+              if (ws.bufferedAmount < 512 * 1024) { // 512KB
+                console.log('✓ Buffer liberado, retomando stream');
+                response.data.resume();
+                clearInterval(checkBuffer);
+              }
+            }, 100);
+          }
+
+          ws.send(chunk);
+        });
+
+        // Quando terminar
+        response.data.on('end', () => {
+          const totalTtsTime = Date.now() - ttsStart;
+          console.log(`✓ Fish Audio completo (${totalTtsTime}ms)`);
+          ws.send(JSON.stringify({ type: 'audio_end' }));
+        });
+
+        response.data.on('error', (error) => {
+          console.error('✗ Erro no stream Fish Audio:', error);
+          ws.send(JSON.stringify({ type: 'error', message: 'Erro no stream de áudio' }));
+        });
+
+      } else {
+        // ElevenLabs (padrão)
+        console.log(`→ Gerando áudio com ElevenLabs (${text.length} chars)...`);
+
+        // Track ElevenLabs usage
+        if (userId) {
+          costTracker.trackElevenLabs(text.length);
+        }
+
+        // Usar voice ID customizado do frontend, ou fallback para env var ou padrão
+        const voiceId = customVoiceId || process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+        console.log(`→ Usando Voice ID: ${voiceId}`);
+        const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+
+        // FIX #12: AbortController para cancelar TTS se usuário interromper
+        currentTTSAbortController = new AbortController();
+
+        // FIX #6: Timeout para ElevenLabs (evita travar)
+        const response = await axios.post(url, {
+          text: text,
+          model_id: 'eleven_turbo_v2_5',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75
+          },
+          optimize_streaming_latency: 4
+        }, {
+          headers: {
+            'Accept': 'audio/mpeg',
+            'xi-api-key': apiKeys.elevenlabs,
+            'Content-Type': 'application/json'
+          },
+          responseType: 'stream',
+          timeout: 10000, // 10s timeout
+          signal: currentTTSAbortController.signal // Permitir cancelamento
+        });
+
+        const ttsTime = Date.now() - ttsStart;
+        console.log(`✓ ElevenLabs stream iniciado (${ttsTime}ms)`);
+
+        // Enviar sinal de início
+        ws.send(JSON.stringify({ type: 'audio_start' }));
+
+        // FIX #8: Fazer streaming dos chunks de áudio com BACKPRESSURE
+        let firstChunk = true;
+        response.data.on('data', (chunk) => {
+          if (firstChunk) {
+            const firstChunkTime = Date.now() - ttsStart;
+            console.log(`🎵 Primeiro chunk de áudio (${firstChunkTime}ms)`);
+            firstChunk = false;
+          }
+
+          // Verificar backpressure (buffer do WebSocket)
+          if (ws.bufferedAmount > 1024 * 1024) { // 1MB
+            console.warn('⚠️  Backpressure detectada, pausando stream');
+            response.data.pause();
+
+            // Retomar quando buffer diminuir
+            const checkBuffer = setInterval(() => {
+              if (ws.bufferedAmount < 512 * 1024) { // 512KB
+                console.log('✓ Buffer liberado, retomando stream');
+                response.data.resume();
+                clearInterval(checkBuffer);
+              }
+            }, 100);
+          }
+
+          ws.send(chunk);
+        });
+
+        // Quando terminar
+        response.data.on('end', () => {
+          const totalTtsTime = Date.now() - ttsStart;
+          console.log(`✓ ElevenLabs completo (${totalTtsTime}ms)`);
+          ws.send(JSON.stringify({ type: 'audio_end' }));
+        });
+
+        response.data.on('error', (error) => {
+          console.error('✗ Erro no stream ElevenLabs:', error);
+          ws.send(JSON.stringify({ type: 'error', message: 'Erro no stream de áudio' }));
+        });
       }
-
-      // Usar voice ID customizado do frontend, ou fallback para env var ou padrão
-      const voiceId = customVoiceId || process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-      console.log(`→ Usando Voice ID: ${voiceId}`);
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
-
-      // FIX #12: AbortController para cancelar TTS se usuário interromper
-      currentTTSAbortController = new AbortController();
-
-      // FIX #6: Timeout para ElevenLabs (evita travar)
-      const response = await axios.post(url, {
-        text: text,
-        model_id: 'eleven_turbo_v2_5',
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75
-        },
-        optimize_streaming_latency: 4
-      }, {
-        headers: {
-          'Accept': 'audio/mpeg',
-          'xi-api-key': apiKeys.elevenlabs,
-          'Content-Type': 'application/json'
-        },
-        responseType: 'stream',
-        timeout: 10000, // 10s timeout
-        signal: currentTTSAbortController.signal // Permitir cancelamento
-      });
-
-      const ttsTime = Date.now() - ttsStart;
-      console.log(`✓ Stream de áudio iniciado (${ttsTime}ms)`);
-
-      // Enviar sinal de início
-      ws.send(JSON.stringify({ type: 'audio_start' }));
-
-      // FIX #8: Fazer streaming dos chunks de áudio com BACKPRESSURE
-      let firstChunk = true;
-      response.data.on('data', (chunk) => {
-        if (firstChunk) {
-          const firstChunkTime = Date.now() - ttsStart;
-          console.log(`🎵 Primeiro chunk de áudio (${firstChunkTime}ms)`);
-          firstChunk = false;
-        }
-
-        // Verificar backpressure (buffer do WebSocket)
-        if (ws.bufferedAmount > 1024 * 1024) { // 1MB
-          console.warn('⚠️  Backpressure detectada, pausando stream');
-          response.data.pause();
-
-          // Retomar quando buffer diminuir
-          const checkBuffer = setInterval(() => {
-            if (ws.bufferedAmount < 512 * 1024) { // 512KB
-              console.log('✓ Buffer liberado, retomando stream');
-              response.data.resume();
-              clearInterval(checkBuffer);
-            }
-          }, 100);
-        }
-
-        ws.send(chunk);
-      });
-
-      // Quando terminar
-      response.data.on('end', () => {
-        const totalTtsTime = Date.now() - ttsStart;
-        console.log(`✓ Áudio completo gerado (${totalTtsTime}ms)`);
-        ws.send(JSON.stringify({ type: 'audio_end' }));
-      });
-
-      response.data.on('error', (error) => {
-        console.error('✗ Erro no stream:', error);
-        ws.send(JSON.stringify({ type: 'error', message: 'Erro no stream de áudio' }));
-      });
 
     } catch (error) {
       console.error('✗ Erro ao gerar TTS:', error.response?.data || error.message);
