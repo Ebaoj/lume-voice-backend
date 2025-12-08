@@ -17,6 +17,7 @@ const { createClient } = require('@deepgram/sdk');
 const OpenAI = require('openai');
 const axios = require('axios');
 const costTracker = require('./costTracker.js');
+const AssistantManager = require('./assistantManager.js');
 
 // ===== Configuração =====
 const PORT = process.env.PORT || 3000;
@@ -61,6 +62,7 @@ wss.on('connection', (ws) => {
   // Clientes dos SDKs (criados após receber as keys)
   let deepgramClient = null;
   let openaiClient = null;
+  let assistantManager = null; // Gerenciador de Assistants API (stateful)
 
   // System prompt customizado (vem do frontend)
   let customSystemPrompt = null;
@@ -135,6 +137,10 @@ wss.on('connection', (ws) => {
               apiKey: apiKeys.openai,
             });
 
+            // Inicializar AssistantManager para conversas stateful
+            assistantManager = new AssistantManager(openaiClient);
+            console.log('✓ AssistantManager inicializado');
+
             ws.send(JSON.stringify({
               type: 'configured',
               message: 'APIs configuradas com sucesso!'
@@ -169,6 +175,23 @@ wss.on('connection', (ws) => {
             sessionStartTime = Date.now(); // Marcar início para calcular duração do áudio
           } else {
             console.warn('⚠️  Cost tracking não iniciado: userId não fornecido');
+          }
+
+          // Criar Assistant e Thread para conversação stateful
+          try {
+            await assistantManager.createAssistant(
+              customSystemPrompt || SYSTEM_PROMPT,
+              simulationId ? `Simulation ${simulationId}` : 'Voice AI Agent'
+            );
+            await assistantManager.createThread();
+            console.log('✓ Assistant e Thread criados para conversação stateful');
+          } catch (error) {
+            console.error('✗ Erro ao criar Assistant/Thread:', error);
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Erro ao inicializar assistente: ' + error.message
+            }));
+            return;
           }
 
           // Verificar se a key do Deepgram está válida
@@ -365,6 +388,11 @@ wss.on('connection', (ws) => {
             currentTTSAbortController = null;
           }
 
+          // Cancelar run do Assistant em andamento
+          if (assistantManager) {
+            await assistantManager.cancelCurrentRun();
+          }
+
           // Avisar cliente para limpar fila de áudio
           ws.send(JSON.stringify({ type: 'clear_audio_queue' }));
 
@@ -391,6 +419,12 @@ wss.on('connection', (ws) => {
           lastFinalTranscript = '';
           isProcessing = false;
 
+          // Limpar AssistantManager
+          if (assistantManager) {
+            await assistantManager.cleanup();
+            assistantManager = null;
+          }
+
           // End cost tracking session
           if (userId) {
             await costTracker.endSession();
@@ -410,163 +444,84 @@ wss.on('connection', (ws) => {
       deepgramLive.finish();
     }
 
+    // Limpar AssistantManager
+    if (assistantManager) {
+      await assistantManager.cleanup();
+    }
+
     // End cost tracking session on disconnect
     if (userId) {
       await costTracker.endSession();
     }
   });
 
-  // ===== Função: Processar com ChatGPT STREAMING e gerar TTS =====
+  // ===== Função: Processar com Assistants API (STATEFUL) =====
   async function processWithGPT(userMessage, ws) {
     const startTime = Date.now();
 
     try {
-      // FIX #9: SANITIZAR LOGS - não logar conteúdo das mensagens (pode ter PII)
-      console.log(`→ Enviando para ChatGPT (length: ${userMessage.length})`);
+      console.log(`→ Enviando mensagem para Assistant (${userMessage.length} chars)`);
 
-      // Adicionar mensagem do usuário ao histórico
-      conversationHistory.push({
-        role: 'user',
-        content: userMessage
-      });
-
-      // FIX #11: Limitar histórico (evita estouro de contexto e custo alto)
-      if (conversationHistory.length > MAX_CONVERSATION_HISTORY) {
-        conversationHistory = conversationHistory.slice(-MAX_CONVERSATION_HISTORY);
-        console.log(`⚠️  Histórico limitado a ${MAX_CONVERSATION_HISTORY} mensagens`);
-      }
-
-      // Preparar mensagens incluindo system prompt
-      const messages = [
-        {
-          role: 'system',
-          content: customSystemPrompt || SYSTEM_PROMPT // Usar prompt customizado ou fallback para padrão
-        },
-        ...conversationHistory
-      ];
-
-      // FIX #6: TIMEOUTS - Chamar OpenAI com timeout (evita travar se API ficar lenta)
-      const gptStart = Date.now();
-
-      // Timeout manual (OpenAI SDK não tem timeout configurável no streaming)
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('OpenAI timeout após 15s')), 15000);
-      });
-
-      const streamPromise = openaiClient.chat.completions.create({
-        model: 'gpt-4o', // Modelo mais inteligente para personagens mais profundos
-        max_tokens: 250, // Mais espaço para respostas elaboradas
-        temperature: 0.8, // Um pouco mais criativo
-        messages: messages,
-        stream: true,
-        stream_options: { include_usage: true }, // Incluir informações de token usage
-      });
-
-      const stream = await Promise.race([streamPromise, timeoutPromise]);
-
-      let fullResponse = '';
-      let sentenceBuffer = '';
-      let firstChunk = true;
       let sentenceCount = 0;
-      let tokenUsage = null; // Armazenar info de usage
 
-      // Processar stream chunk por chunk
-      for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content || '';
+      // Usar AssistantManager para enviar mensagem e receber streaming
+      const result = await assistantManager.sendMessage(
+        userMessage,
+        // Callback para cada frase completa (para TTS)
+        async (sentence) => {
+          sentenceCount++;
+          console.log(`📤 Frase ${sentenceCount} (${sentence.length} chars)`);
 
-        // Capturar usage info (vem no último chunk)
-        if (chunk.usage) {
-          tokenUsage = chunk.usage;
-        }
+          // Enviar frase para o cliente (debug visual)
+          ws.send(JSON.stringify({
+            type: 'response_partial',
+            text: sentence
+          }));
 
-        if (content) {
-          if (firstChunk) {
-            const firstTokenTime = Date.now() - gptStart;
-            console.log(`⚡ Primeiro token ChatGPT (${firstTokenTime}ms)`);
-            firstChunk = false;
-          }
+          // 🚀 Gerar TTS da frase imediatamente
+          await generateTTS(sentence, ws).catch(err => {
+            console.error('Erro TTS frase:', err);
+          });
+        },
+        // Callback quando resposta completa
+        (fullResponse, usage) => {
+          console.log(`✓ Assistant completo (${fullResponse.length} chars)`);
 
-          fullResponse += content;
-          sentenceBuffer += content;
+          // Enviar resposta completa
+          ws.send(JSON.stringify({
+            type: 'response',
+            text: fullResponse
+          }));
 
-          // Detectar fim de frase (., ?, !, \n)
-          const sentenceEndMatch = sentenceBuffer.match(/[.!?]\s|[.!?]$|\n/);
-          if (sentenceEndMatch) {
-            const sentence = sentenceBuffer.trim();
-            if (sentence.length > 0) {
-              sentenceCount++;
-              // FIX #9: Não logar conteúdo da frase (PII)
-              console.log(`📤 Frase ${sentenceCount} (${sentence.length} chars)`);
+          // Enviar informações de token usage para o frontend
+          if (usage) {
+            ws.send(JSON.stringify({
+              type: 'token_usage',
+              usage: {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens
+              }
+            }));
+            console.log(`📊 Tokens: ${usage.prompt_tokens} input + ${usage.completion_tokens} output = ${usage.total_tokens} total`);
 
-              // Enviar frase para o cliente (debug visual)
-              ws.send(JSON.stringify({
-                type: 'response_partial',
-                text: sentence
-              }));
-
-              // 🚀 INOVAÇÃO: Gerar TTS da frase imediatamente (await para sequencial)
-              await generateTTS(sentence, ws).catch(err => {
-                console.error('Erro TTS frase:', err);
-              });
-
-              sentenceBuffer = ''; // Limpar buffer
+            // Track OpenAI usage
+            if (userId) {
+              costTracker.trackOpenAI(usage.prompt_tokens, usage.completion_tokens);
             }
           }
+
+          const totalTime = Date.now() - startTime;
+          console.log(`⏱️ Tempo total pipeline: ${totalTime}ms`);
+          console.log(`💰 Economia estimada: 90% menos tokens input vs stateless!`);
         }
-      }
-
-      // Processar último pedaço se sobrou
-      if (sentenceBuffer.trim().length > 0) {
-        console.log(`📤 Frase final: "${sentenceBuffer.trim()}"`);
-        ws.send(JSON.stringify({
-          type: 'response_partial',
-          text: sentenceBuffer.trim()
-        }));
-        await generateTTS(sentenceBuffer.trim(), ws);
-      }
-
-      const gptTime = Date.now() - gptStart;
-      // FIX #9: Não logar resposta completa (PII)
-      console.log(`✓ ChatGPT completo (${gptTime}ms, ${fullResponse.length} chars)`);
-
-      // Adicionar resposta ao histórico
-      conversationHistory.push({
-        role: 'assistant',
-        content: fullResponse
-      });
-
-      // Enviar resposta completa
-      ws.send(JSON.stringify({
-        type: 'response',
-        text: fullResponse
-      }));
-
-      // Enviar informações de token usage para o frontend
-      if (tokenUsage) {
-        ws.send(JSON.stringify({
-          type: 'token_usage',
-          usage: {
-            prompt_tokens: tokenUsage.prompt_tokens,
-            completion_tokens: tokenUsage.completion_tokens,
-            total_tokens: tokenUsage.total_tokens
-          }
-        }));
-        console.log(`📊 Tokens: ${tokenUsage.prompt_tokens} input + ${tokenUsage.completion_tokens} output = ${tokenUsage.total_tokens} total`);
-
-        // Track OpenAI usage
-        if (userId) {
-          costTracker.trackOpenAI(tokenUsage.prompt_tokens, tokenUsage.completion_tokens);
-        }
-      }
-
-      const totalTime = Date.now() - startTime;
-      console.log(`⏱️ Tempo total pipeline: ${totalTime}ms`);
+      );
 
     } catch (error) {
-      console.error('✗ Erro ao processar com ChatGPT:', error);
+      console.error('✗ Erro ao processar com Assistant:', error);
       ws.send(JSON.stringify({
         type: 'error',
-        message: 'Erro ao processar com LLM'
+        message: 'Erro ao processar com LLM: ' + error.message
       }));
     }
   }
