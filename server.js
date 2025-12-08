@@ -554,6 +554,11 @@ wss.on('connection', (ws) => {
       if (ttsProvider === 'fishaudio') {
         console.log(`→ Gerando áudio com Fish Audio (${text.length} chars)...`);
 
+        // Validar se Fish Audio está configurado
+        if (!fishAudioService) {
+          throw new Error('Fish Audio não configurado. Forneça uma API key válida.');
+        }
+
         // Track Fish Audio usage
         if (userId) {
           costTracker.trackFishAudio(text.length);
