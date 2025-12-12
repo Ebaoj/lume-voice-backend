@@ -19,6 +19,8 @@ const axios = require('axios');
 const costTracker = require('./costTracker.js');
 const AssistantManager = require('./assistantManager.js');
 const FishAudioService = require('./fishAudioService.js');
+const EmotionInjector = require('./emotionInjector.js');
+const VoiceProfileManager = require('./voiceProfiles.js');
 
 // ===== Configuração =====
 const PORT = process.env.PORT || 3000;
@@ -66,6 +68,8 @@ wss.on('connection', (ws) => {
   let openaiClient = null;
   let assistantManager = null; // Gerenciador de Assistants API (stateful)
   let fishAudioService = null; // Serviço Fish Audio TTS
+  let emotionInjector = null; // Injetor de emoções Fish Audio
+  let voiceProfileManager = null; // Gerenciador de perfis de voz
 
   // System prompt customizado (vem do frontend)
   let customSystemPrompt = null;
@@ -75,6 +79,18 @@ wss.on('connection', (ws) => {
 
   // TTS Provider selecionado ('elevenlabs' ou 'fishaudio')
   let ttsProvider = 'elevenlabs'; // Default ElevenLabs
+
+  // Configurações Fish Audio (vem do frontend)
+  let fishAudioConfig = {
+    voiceId: null,           // Voice ID customizado
+    voiceProfile: null,      // Perfil de voz (customer_service_calm, etc)
+    prosody: {
+      speed: 1.15,           // Velocidade padrão para PT-BR
+      volume: 0
+    },
+    scenarioType: 'customer_service', // Tipo de cenário para emoções
+    injectEmotions: true     // Se deve injetar emoções automaticamente
+  };
 
   ws.on('message', async (message) => {
     try {
@@ -138,6 +154,19 @@ wss.on('connection', (ws) => {
             console.log('→ Voice ID ElevenLabs recebido:', customVoiceId);
           }
 
+          // Capturar configurações Fish Audio do frontend
+          if (data.fishAudioConfig) {
+            fishAudioConfig = {
+              ...fishAudioConfig,
+              ...data.fishAudioConfig,
+              prosody: {
+                ...fishAudioConfig.prosody,
+                ...(data.fishAudioConfig.prosody || {})
+              }
+            };
+            console.log('→ Fish Audio config recebida:', JSON.stringify(fishAudioConfig, null, 2));
+          }
+
           console.log('→ Deepgram key:', apiKeys.deepgram.substring(0, 8) + '...' + apiKeys.deepgram.substring(apiKeys.deepgram.length - 4));
           console.log('→ Deepgram key length:', apiKeys.deepgram.length);
 
@@ -156,8 +185,31 @@ wss.on('connection', (ws) => {
 
             // Inicializar Fish Audio se key fornecida
             if (apiKeys.fishaudio && apiKeys.fishaudio.length > 0) {
-              fishAudioService = new FishAudioService(apiKeys.fishaudio);
-              console.log('✓ FishAudioService inicializado');
+              // Configurações iniciais do Fish Audio
+              const fishAudioOptions = {
+                prosody: fishAudioConfig.prosody,
+                latency: 'balanced'
+              };
+
+              // Se tem perfil de voz, usar configurações do perfil
+              if (fishAudioConfig.voiceProfile) {
+                voiceProfileManager = new VoiceProfileManager();
+                if (voiceProfileManager.setCurrentProfile(fishAudioConfig.voiceProfile)) {
+                  const profileConfig = voiceProfileManager.getFishAudioConfig();
+                  Object.assign(fishAudioOptions, profileConfig);
+                  console.log(`✓ Usando perfil: ${fishAudioConfig.voiceProfile}`);
+                }
+              }
+
+              fishAudioService = new FishAudioService(apiKeys.fishaudio, fishAudioOptions);
+
+              // Inicializar EmotionInjector se injeção de emoções está habilitada
+              if (fishAudioConfig.injectEmotions) {
+                emotionInjector = new EmotionInjector(fishAudioConfig.scenarioType);
+                console.log('✓ EmotionInjector inicializado');
+              }
+
+              console.log('✓ FishAudioService v2 inicializado com configurações avançadas');
             }
 
             ws.send(JSON.stringify({
@@ -567,8 +619,30 @@ wss.on('connection', (ws) => {
         // FIX #12: AbortController para cancelar TTS se usuário interromper
         currentTTSAbortController = new AbortController();
 
+        // Processar texto com EmotionInjector APENAS se:
+        // 1. EmotionInjector está inicializado
+        // 2. injectEmotions está habilitado
+        // 3. A voz suporta emotion tags (vozes UGC geralmente não suportam)
+        let processedText = text;
+        const supportsEmotions = fishAudioService.defaults?.supportsEmotionTags ?? false;
+
+        if (emotionInjector && fishAudioConfig.injectEmotions && supportsEmotions) {
+          processedText = emotionInjector.injectEmotion(text);
+          console.log(`  → Emoção injetada: ${processedText.substring(0, 60)}...`);
+        } else if (fishAudioConfig.injectEmotions && !supportsEmotions) {
+          console.log(`  → Emotion tags desabilitadas (voz UGC não suporta)`);
+        }
+
+        // Preparar opções de TTS
+        const ttsOptions = {
+          prosody: fishAudioConfig.prosody
+        };
+
+        // Usar voice ID customizado se fornecido
+        const voiceId = fishAudioConfig.voiceId || null;
+
         // Chamar Fish Audio TTS com streaming
-        const response = await fishAudioService.textToSpeech(text, null, {});
+        const response = await fishAudioService.textToSpeech(processedText, voiceId, ttsOptions);
 
         const ttsTime = Date.now() - ttsStart;
         console.log(`✓ Fish Audio stream iniciado (${ttsTime}ms)`);
