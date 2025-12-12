@@ -26,7 +26,7 @@ class AssistantManager {
     this.assistant = await this.client.beta.assistants.create({
       name: assistantName,
       instructions: systemPrompt,
-      model: 'gpt-4o',
+      model: 'gpt-4o-mini', // 94% mais barato que gpt-4o, excelente para voice AI
       temperature: 0.8,
       tools: [] // Sem tools por enquanto
     });
