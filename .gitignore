@@ -34,3 +34,4 @@ supabase-management-mcp/
 # Scripts de teste
 test-*.js
 configure-*.sh
+*.mp3
