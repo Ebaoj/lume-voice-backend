@@ -633,9 +633,10 @@ wss.on('connection', (ws) => {
         currentTTSAbortController = new AbortController();
 
         // FIX #6: Timeout para ElevenLabs (evita travar)
+        // Usando eleven_v3 com Audio Tags para emoções expressivas
         const response = await axios.post(url, {
           text: text,
-          model_id: 'eleven_turbo_v2_5',
+          model_id: 'eleven_v3',
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.75
